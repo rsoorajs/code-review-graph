@@ -595,6 +595,8 @@ def d8():
         ("Continue",     "~/.continue/config.json",              YLW, YLW_BG),
         ("OpenCode",     ".opencode.json",                       RED, RED_BG),
         ("Antigravity",  "~/.gemini/antigravity/mcp_config.json",GRY, GRY_BG),
+        ("Qwen Code",    "~/.qwen/settings.json",                BLU, PRP_BG),  # blue-purple
+        ("Qoder",        ".qoder/mcp.json",                      GRN, ORG_BG),  # green-orange
     ]
 
     # Central "install" node
@@ -604,8 +606,8 @@ def d8():
 
     # Fan out to platforms
     cols = len(platforms)
-    card_w, card_h = 140, 80
-    total_w = cols * card_w + (cols-1) * 20
+    card_w, card_h = 120, 80  # narrower cards for 9 platforms
+    total_w = cols * card_w + (cols-1) * 15  # tighter spacing
     x0 = center_x - total_w/2
     card_y = 360
 
