@@ -57,7 +57,9 @@ class NodeInfo:
 
 @dataclass
 class EdgeInfo:
-    kind: str  # CALLS, IMPORTS_FROM, INHERITS, IMPLEMENTS, CONTAINS, TESTED_BY, DEPENDS_ON
+    # CALLS, IMPORTS_FROM, INHERITS, IMPLEMENTS, CONTAINS,
+    # TESTED_BY, DEPENDS_ON, REFERENCES
+    kind: str
     source: str  # qualified name or path
     target: str  # qualified name or path
     file_path: str
@@ -101,8 +103,58 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".t": "perl",
     ".xs": "c",  # Perl XS: parsed as C to capture functions/structs/includes
     ".lua": "lua",
+    ".luau": "luau",
+    ".m": "objc",  # Objective-C (.h still maps to C; .mm defers to C++ for simplicity)
+    ".sh": "bash",
+    ".bash": "bash",
+    ".zsh": "bash",
+    ".ksh": "bash",  # Korn shell — close enough to bash for tree-sitter-bash (#235)
+    ".ex": "elixir",
+    ".exs": "elixir",
     ".ipynb": "notebook",
+    ".zig": "zig",
+    ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".psd1": "powershell",
+    ".svelte": "svelte",
+    ".jl": "julia",
+    ".gd": "gdscript",
 }
+
+# Shebang interpreter → language mapping for extension-less Unix scripts.
+# Each key is the **basename** of the interpreter path as it appears after
+# ``#!`` (or after ``#!/usr/bin/env``).  Only languages already registered
+# above are listed — this file strictly routes extension-less scripts, it
+# does NOT introduce new languages on its own.  See issue #237.
+SHEBANG_INTERPRETER_TO_LANGUAGE: dict[str, str] = {
+    # POSIX / bash-compatible shells — all routed through tree-sitter-bash
+    "bash": "bash",
+    "sh": "bash",
+    "zsh": "bash",
+    "ksh": "bash",
+    "dash": "bash",
+    "ash": "bash",
+    # Python (every common variant)
+    "python": "python",
+    "python2": "python",
+    "python3": "python",
+    "pypy": "python",
+    "pypy3": "python",
+    # JavaScript via Node
+    "node": "javascript",
+    "nodejs": "javascript",
+    # Ruby / Perl / Lua / R / PHP
+    "ruby": "ruby",
+    "perl": "perl",
+    "lua": "lua",
+    "Rscript": "r",
+    "php": "php",
+}
+
+# Maximum bytes to read from the head of a file when probing for a shebang.
+# 256 is enough for any reasonable shebang line (``#!/usr/bin/env python3 -u\n``
+# is ~30 chars) while keeping the worst-case read tiny even on fat binaries.
+_SHEBANG_PROBE_BYTES = 256
 
 # Tree-sitter node type mappings per language
 # Maps (language) -> dict of semantic role -> list of TS node types
@@ -136,6 +188,22 @@ _CLASS_TYPES: dict[str, list[str]] = {
     ],
     "dart": ["class_definition", "mixin_declaration", "enum_declaration"],
     "lua": [],  # Lua has no class keyword; table-based OOP handled via constructs handler
+    "luau": ["type_definition"],  # Luau type aliases; table-based OOP via constructs handler
+    "objc": [
+        "class_interface", "class_implementation",
+        "category_interface", "protocol_declaration",
+    ],
+    "bash": [],  # Shell has no classes
+    # Elixir: `defmodule Name do ... end` is a ``call`` node whose first
+    # identifier is literally "defmodule". Dispatched via
+    # _extract_elixir_constructs to avoid matching every ``call`` here.
+    "elixir": [],
+    "zig": ["container_declaration"],
+    "powershell": ["class_statement"],
+    "julia": ["struct_definition", "abstract_definition"],
+    # GDScript: inner classes use ``class Name:`` (class_definition); the
+    # file-level ``class_name Name`` gives the script itself an identity.
+    "gdscript": ["class_definition", "class_name_statement"],
 }
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
@@ -170,6 +238,24 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     # function_signature inside it).
     "dart": ["function_signature"],
     "lua": ["function_declaration"],
+    "luau": ["function_declaration"],
+    # Objective-C: method_definition lives inside implementation_definition
+    # inside class_implementation. C-style function_definition is also present
+    # for main() and helper functions.
+    "objc": ["method_definition", "function_definition"],
+    # Bash: only function_definition; everything else is a command.
+    "bash": ["function_definition"],
+    # Elixir: def/defp/defmacro are all ``call`` nodes whose first
+    # identifier matches. Dispatched via _extract_elixir_constructs.
+    "elixir": [],
+    "zig": ["fn_proto", "fn_decl"],
+    "powershell": ["function_statement"],
+    "julia": [
+        "function_definition",
+        "short_function_definition",
+    ],
+    # GDScript: ``func name(args) -> ReturnType:`` — includes ``static func``.
+    "gdscript": ["function_definition"],
 }
 
 _IMPORT_TYPES: dict[str, list[str]] = {
@@ -193,8 +279,28 @@ _IMPORT_TYPES: dict[str, list[str]] = {
     "solidity": ["import_directive"],
     # Dart: import_or_export wraps library_import > import_specification > configurable_uri
     "dart": ["import_or_export"],
-    # Lua: require() is a function_call, handled via _extract_lua_constructs
+    # Lua/Luau: require() is a function_call, handled via _extract_lua_constructs
     "lua": [],
+    "luau": [],
+    # Objective-C: #import "..." and #include "..." both arrive as preproc_include
+    # (tree-sitter-objc doesn't distinguish via a separate preproc_import node).
+    "objc": ["preproc_include"],
+    # Bash: source / . <file> is a command — handled in _extract_bash_source below.
+    "bash": [],
+    # Elixir: alias/import/require/use are all ``call`` nodes —
+    # handled in _extract_elixir_constructs.
+    "elixir": [],
+    # Zig: @import("...") is a builtin_call_expr — handled
+    # generically via call types below.
+    "zig": [],
+    "powershell": [],
+    # Julia: import/using are import_statement nodes.
+    "julia": ["import_statement", "using_statement"],
+    # GDScript has no ``import`` keyword. The closest analogue is
+    # ``extends OtherClass`` / ``extends "res://path.gd"``, which establishes
+    # a hard dependency on the parent script. preload()/load() calls remain
+    # as ordinary CALLS edges.
+    "gdscript": ["extends_statement"],
 }
 
 _CALL_TYPES: dict[str, list[str]] = {
@@ -216,10 +322,31 @@ _CALL_TYPES: dict[str, list[str]] = {
     ],
     "kotlin": ["call_expression"],
     "swift": ["call_expression"],
-    "php": ["function_call_expression", "member_call_expression"],
+    "php": [
+        "function_call_expression",
+        "member_call_expression",
+        "scoped_call_expression",
+        "nullsafe_member_call_expression",
+    ],
     "scala": ["call_expression", "instance_expression", "generic_function"],
     "solidity": ["call_expression"],
     "lua": ["function_call"],
+    "luau": ["function_call"],
+    # Objective-C: [receiver message:args] produces message_expression;
+    # C-style foo(x) produces call_expression.
+    "objc": ["message_expression", "call_expression"],
+    # Bash: every command invocation is a "command" node.
+    "bash": ["command"],
+    # Elixir: everything is a ``call`` node — dispatched via
+    # _extract_elixir_constructs which filters out def/defmodule/alias/etc.
+    # before treating what's left as a real call.
+    "elixir": [],
+    "zig": ["call_expression", "builtin_call_expr"],
+    "powershell": ["command_expression"],
+    "julia": ["call_expression"],
+    # GDScript: bare calls produce ``call``; ``obj.method()`` is an
+    # ``attribute`` node whose right-hand side is an ``attribute_call``.
+    "gdscript": ["call", "attribute_call"],
 }
 
 # Patterns that indicate a test function
@@ -295,18 +422,104 @@ class CodeParser:
     def __init__(self) -> None:
         self._parsers: dict[str, object] = {}
         self._module_file_cache: dict[str, Optional[str]] = {}
+        self._export_symbol_cache: dict[str, Optional[str]] = {}
         self._tsconfig_resolver = TsconfigResolver()
+        # Per-parse cache of Dart pubspec root lookups; see #87
+        self._dart_pubspec_cache: dict[tuple[str, str], Optional[Path]] = {}
 
     def _get_parser(self, language: str):  # type: ignore[arg-type]
         if language not in self._parsers:
             try:
                 self._parsers[language] = tslp.get_parser(language)  # type: ignore[arg-type]
-            except Exception:
+            except (LookupError, ValueError, ImportError) as exc:
+                # language not packaged, or grammar load failed
+                logger.debug("tree-sitter parser unavailable for %s: %s", language, exc)
                 return None
         return self._parsers[language]
 
     def detect_language(self, path: Path) -> Optional[str]:
-        return EXTENSION_TO_LANGUAGE.get(path.suffix.lower())
+        """Map a file path to its language name.
+
+        Extension-based lookup is tried first.  For extension-less files
+        (typical for Unix scripts like ``bin/myapp`` or ``.git/hooks/pre-commit``)
+        we fall back to reading the first line for a shebang.  Files that
+        already have a known extension are never re-read — shebang probing
+        only runs when the extension lookup returns ``None`` **and** the path
+        has no suffix at all.  See issue #237.
+        """
+        suffix = path.suffix.lower()
+        lang = EXTENSION_TO_LANGUAGE.get(suffix)
+        if lang is not None:
+            return lang
+        # Only probe shebang for files without any extension — "README", "LICENSE",
+        # and other extension-less text files also fall here, but the probe is a
+        # cheap 256-byte read that returns None when no shebang is found.
+        if suffix == "":
+            return self._detect_language_from_shebang(path)
+        return None
+
+    @staticmethod
+    def _detect_language_from_shebang(path: Path) -> Optional[str]:
+        """Inspect the first line of ``path`` for a shebang interpreter.
+
+        Returns the mapped language name or ``None`` if the file has no
+        shebang, is unreadable, or names an interpreter we don't map.
+
+        Accepted shapes::
+
+            #!/bin/bash
+            #!/usr/bin/env python3
+            #!/usr/bin/env -S node --experimental-vm-modules
+            #!/usr/bin/bash -e
+
+        Only the basename of the interpreter is consulted.  Trailing flags
+        after the interpreter are ignored.  Windows-style ``\r\n`` line
+        endings are handled.  Binary files read as garbage bytes simply
+        fail the ``#!`` prefix check and return ``None``.
+        """
+        try:
+            with path.open("rb") as fh:
+                head = fh.read(_SHEBANG_PROBE_BYTES)
+        except (OSError, PermissionError):
+            return None
+        if not head.startswith(b"#!"):
+            return None
+
+        # Take just the first line, stripped of leading "#!" and any
+        # surrounding whitespace.  Split on NUL to defend against accidental
+        # binary content following a ``#!`` prefix.
+        first_line = head.split(b"\n", 1)[0].split(b"\0", 1)[0]
+        try:
+            line = first_line[2:].decode("utf-8", errors="strict").strip()
+        except UnicodeDecodeError:
+            return None
+        if not line:
+            return None
+
+        tokens = line.split()
+        if not tokens:
+            return None
+
+        first = tokens[0]
+        # `/usr/bin/env` indirection: the interpreter is the next token.
+        # `/usr/bin/env -S node --flag` is also valid — skip any leading
+        # ``-`` options after env.
+        if first.endswith("/env") or first == "env":
+            interpreter_token: Optional[str] = None
+            for tok in tokens[1:]:
+                if tok.startswith("-"):
+                    # ``-S`` takes no argument in most envs; skip and continue.
+                    continue
+                interpreter_token = tok
+                break
+            if interpreter_token is None:
+                return None
+            interpreter = interpreter_token.rsplit("/", 1)[-1]
+        else:
+            # Direct form: ``#!/bin/bash`` or ``#!/usr/local/bin/python3``.
+            interpreter = first.rsplit("/", 1)[-1]
+
+        return SHEBANG_INTERPRETER_TO_LANGUAGE.get(interpreter)
 
     def parse_file(self, path: Path) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse a single file and return extracted nodes and edges."""
@@ -330,15 +543,28 @@ class CodeParser:
         if language == "vue":
             return self._parse_vue(path, source)
 
+        # Svelte SFCs: same approach as Vue — extract <script> blocks
+        if language == "svelte":
+            return self._parse_svelte(path, source)
+
         # Jupyter notebooks: extract code cells and parse as Python
         if language == "notebook":
             return self._parse_notebook(path, source)
 
-        # Databricks .py notebook exports
-        if language == "python" and source.startswith(
-            b"# Databricks notebook source\n",
-        ):
-            return self._parse_databricks_py_notebook(path, source)
+        # Databricks .py notebook exports.  The header is ALWAYS the very
+        # first line, but the file may have CRLF line endings on Windows
+        # (git's core.autocrlf=true default).  Match the first line robustly
+        # after stripping any trailing ``\r`` so the detection works on both
+        # platforms.  See issue #239.
+        if language == "python":
+            first_newline = source.find(b"\n")
+            first_line = (
+                source[:first_newline].rstrip(b"\r")
+                if first_newline != -1
+                else source.rstrip(b"\r")
+            )
+            if first_line == b"# Databricks notebook source":
+                return self._parse_databricks_py_notebook(path, source)
 
         parser = self._get_parser(language)
         if not parser:
@@ -496,6 +722,136 @@ class CodeParser:
                     test_qnames.add(qn)
             for edge in list(all_edges):
                 if edge.kind == "CALLS" and edge.source in test_qnames:
+                    all_edges.append(EdgeInfo(
+                        kind="TESTED_BY",
+                        source=edge.target,
+                        target=edge.source,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                    ))
+
+        return all_nodes, all_edges
+
+    def _parse_svelte(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Parse a Svelte SFC by extracting <script> blocks.
+
+        Uses the same approach as Vue: parse the outer HTML structure,
+        locate ``<script>`` blocks, detect ``lang="ts"`` for TypeScript,
+        and delegate each block to the appropriate JS/TS parser.
+        """
+        # Svelte uses HTML-like structure; reuse the vue grammar which
+        # also handles generic HTML with <script> elements.
+        svelte_parser = self._get_parser("svelte")
+        # Fall back to the vue grammar if a dedicated svelte grammar
+        # is not available in the installed tree-sitter language pack.
+        if not svelte_parser:
+            svelte_parser = self._get_parser("vue")
+        if not svelte_parser:
+            return [], []
+
+        tree = svelte_parser.parse(source)
+        file_path_str = str(path)
+        test_file = _is_test_file(file_path_str)
+
+        all_nodes: list[NodeInfo] = [NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language="svelte",
+            is_test=test_file,
+        )]
+        all_edges: list[EdgeInfo] = []
+
+        # Walk root children looking for script_element blocks
+        for child in tree.root_node.children:
+            if child.type != "script_element":
+                continue
+
+            script_lang = "javascript"
+            start_tag = None
+            raw_text_node = None
+            for sub in child.children:
+                if sub.type == "start_tag":
+                    start_tag = sub
+                elif sub.type == "raw_text":
+                    raw_text_node = sub
+
+            if start_tag:
+                for attr in start_tag.children:
+                    if attr.type == "attribute":
+                        attr_name = None
+                        attr_value = None
+                        for a in attr.children:
+                            if a.type == "attribute_name":
+                                attr_name = a.text.decode(
+                                    "utf-8", errors="replace",
+                                )
+                            elif a.type == "quoted_attribute_value":
+                                for v in a.children:
+                                    if v.type == "attribute_value":
+                                        attr_value = v.text.decode(
+                                            "utf-8",
+                                            errors="replace",
+                                        )
+                        if (
+                            attr_name == "lang"
+                            and attr_value
+                            in ("ts", "typescript")
+                        ):
+                            script_lang = "typescript"
+
+            if not raw_text_node:
+                continue
+
+            script_source = raw_text_node.text
+            line_offset = raw_text_node.start_point[0]
+
+            script_parser = self._get_parser(script_lang)
+            if not script_parser:
+                continue
+
+            script_tree = script_parser.parse(script_source)
+            import_map, defined_names = self._collect_file_scope(
+                script_tree.root_node, script_lang, script_source,
+            )
+
+            nodes: list[NodeInfo] = []
+            edges: list[EdgeInfo] = []
+            self._extract_from_tree(
+                script_tree.root_node, script_source,
+                script_lang, file_path_str, nodes, edges,
+                import_map=import_map,
+                defined_names=defined_names,
+            )
+
+            for node in nodes:
+                node.line_start += line_offset
+                node.line_end += line_offset
+                node.language = "svelte"
+            for edge in edges:
+                edge.line += line_offset
+
+            all_nodes.extend(nodes)
+            all_edges.extend(edges)
+
+        # Generate TESTED_BY edges
+        if test_file:
+            test_qnames = set()
+            for n in all_nodes:
+                if n.is_test:
+                    qn = self._qualify(
+                        n.name, n.file_path, n.parent_name,
+                    )
+                    test_qnames.add(qn)
+            for edge in list(all_edges):
+                if (
+                    edge.kind == "CALLS"
+                    and edge.source in test_qnames
+                ):
                     all_edges.append(EdgeInfo(
                         kind="TESTED_BY",
                         source=edge.target,
@@ -845,7 +1201,7 @@ class CodeParser:
 
         resolved: list[EdgeInfo] = []
         for edge in edges:
-            if edge.kind == "CALLS" and "::" not in edge.target:
+            if edge.kind in ("CALLS", "REFERENCES") and "::" not in edge.target:
                 if edge.target in symbols:
                     edge = EdgeInfo(
                         kind=edge.kind,
@@ -908,13 +1264,50 @@ class CodeParser:
             ):
                 continue
 
-            # --- Lua-specific constructs ---
-            if language == "lua" and self._extract_lua_constructs(
+            # --- Lua/Luau-specific constructs ---
+            if language in ("lua", "luau") and self._extract_lua_constructs(
                 child, node_type, source, language, file_path,
                 nodes, edges, enclosing_class, enclosing_func,
                 import_map, defined_names, _depth,
             ):
                 continue
+
+            # --- Bash-specific constructs ---
+            # ``source ./foo.sh`` and ``. ./foo.sh`` are commands in
+            # tree-sitter-bash; re-interpret them as IMPORTS_FROM edges so
+            # cross-script wiring works the same as in other languages.
+            if language == "bash" and node_type == "command":
+                if self._extract_bash_source_command(
+                    child, file_path, edges,
+                ):
+                    continue
+
+            # --- Elixir-specific constructs ---
+            # Every top-level construct in Elixir is a ``call`` node:
+            # defmodule, def/defp/defmacro, alias/import/require/use, and
+            # ordinary function invocations all share the same node type.
+            # Dispatch via _extract_elixir_constructs so we can tell them
+            # apart by the first-identifier text and still recurse into
+            # bodies with the correct enclosing scope. See: #112
+            if language == "elixir" and node_type == "call":
+                if self._extract_elixir_constructs(
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
+                ):
+                    continue
+
+            # --- Dart call detection (see #87) ---
+            # tree-sitter-dart does not wrap calls in a single
+            # ``call_expression`` node; instead the pattern is
+            # ``identifier + selector > argument_part`` as siblings inside
+            # the parent.  Scan child's children here and emit CALLS edges
+            # for any we find; nested calls are handled by the main recursion.
+            if language == "dart":
+                self._extract_dart_calls_from_children(
+                    child, source, file_path, edges,
+                    enclosing_class, enclosing_func,
+                )
 
             # --- JS/TS variable-assigned functions (const foo = () => {}) ---
             if (
@@ -972,6 +1365,24 @@ class CodeParser:
                 ):
                     continue
 
+            # --- JSX component invocations ---
+            if (
+                language in ("javascript", "typescript", "tsx")
+                and node_type in ("jsx_opening_element", "jsx_self_closing_element")
+            ):
+                self._extract_jsx_component_call(
+                    child, language, file_path, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names,
+                )
+
+            # --- Value references (function-as-value in maps, arrays, args) ---
+            self._extract_value_references(
+                child, node_type, source, language, file_path, edges,
+                enclosing_class, enclosing_func,
+                import_map, defined_names,
+            )
+
             # --- Solidity-specific constructs ---
             if language == "solidity" and self._extract_solidity_constructs(
                 child, node_type, source, file_path, nodes, edges,
@@ -987,6 +1398,349 @@ class CodeParser:
                 import_map=import_map, defined_names=defined_names,
                 _depth=_depth + 1,
             )
+
+    def _elixir_call_identifier(self, node) -> Optional[str]:
+        """Return the leading identifier of an Elixir ``call`` node.
+
+        For ``def add(a, b)`` returns ``"def"``; for ``defmodule Calc``
+        returns ``"defmodule"``; for ``IO.puts(msg)`` returns the dotted
+        path's final identifier (``"puts"``); for ``alias Calculator``
+        returns ``"alias"``.
+        """
+        if not node.children:
+            return None
+        first = node.children[0]
+        if first.type == "identifier":
+            return first.text.decode("utf-8", errors="replace")
+        # Dotted calls: dot > left: alias "IO", right: identifier "puts"
+        if first.type == "dot":
+            for child in reversed(first.children):
+                if child.type == "identifier":
+                    return child.text.decode("utf-8", errors="replace")
+        return None
+
+    def _elixir_module_name(self, arguments) -> Optional[str]:
+        """Extract a module name from a ``defmodule`` / ``alias`` / etc.
+        arguments node. Supports ``Calc`` (single alias) and ``Foo.Bar``
+        (dotted alias inside a `dot` node).
+        """
+        for child in arguments.children:
+            if child.type == "alias":
+                return child.text.decode("utf-8", errors="replace")
+            if child.type == "dot":
+                return child.text.decode("utf-8", errors="replace")
+        return None
+
+    def _elixir_function_name_and_params(
+        self, arguments, source: bytes,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Extract the function name and parameter list from a ``def``/
+        ``defp``/``defmacro`` arguments node.
+
+        The ``arguments`` of a ``def`` call wraps another ``call`` whose
+        first child is the function's identifier and whose children
+        (past the parens) are the parameters.
+        """
+        for child in arguments.children:
+            if child.type == "call":
+                name: Optional[str] = None
+                for sub in child.children:
+                    if sub.type == "identifier" and name is None:
+                        name = sub.text.decode("utf-8", errors="replace")
+                # Parameter text is everything between the parens of
+                # the inner call; source slice is simplest.
+                params_text = child.text.decode("utf-8", errors="replace")
+                # Strip the function name off the front.
+                if name and params_text.startswith(name):
+                    params_text = params_text[len(name):]
+                return name, params_text
+            if child.type == "identifier":
+                # Zero-arity def like `def reset, do: ...` has no inner
+                # call; just the identifier.
+                return child.text.decode("utf-8", errors="replace"), None
+        return None, None
+
+    def _extract_elixir_constructs(
+        self,
+        node,
+        source: bytes,
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Handle every Elixir ``call`` node by dispatching on the leading
+        identifier. See: #112
+
+        Returns True if the node was fully handled (and the main loop
+        should skip generic recursion); False to let the default dispatch
+        continue (never used here — Elixir has no other node types).
+        """
+        ident = self._elixir_call_identifier(node)
+        if ident is None:
+            return False
+
+        # ---- defmodule Name do ... end ----------------------------------
+        if ident == "defmodule":
+            arguments = None
+            do_block = None
+            for sub in node.children:
+                if sub.type == "arguments":
+                    arguments = sub
+                elif sub.type == "do_block":
+                    do_block = sub
+            if arguments is None:
+                return False
+            mod_name = self._elixir_module_name(arguments)
+            if mod_name is None:
+                return False
+            qualified = self._qualify(mod_name, file_path, None)
+            nodes.append(NodeInfo(
+                kind="Class",
+                name=mod_name,
+                file_path=file_path,
+                line_start=node.start_point[0] + 1,
+                line_end=node.end_point[0] + 1,
+                language=language,
+                parent_name=None,
+            ))
+            # CONTAINS file -> module
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path,
+                target=qualified,
+                file_path=file_path,
+                line=node.start_point[0] + 1,
+            ))
+            if do_block is not None:
+                self._extract_from_tree(
+                    do_block, source, language, file_path, nodes, edges,
+                    enclosing_class=mod_name,
+                    enclosing_func=None,
+                    import_map=import_map, defined_names=defined_names,
+                    _depth=_depth + 1,
+                )
+            return True
+
+        # ---- def / defp / defmacro / defmacrop -------------------------
+        if ident in ("def", "defp", "defmacro", "defmacrop"):
+            arguments = None
+            do_block = None
+            for sub in node.children:
+                if sub.type == "arguments":
+                    arguments = sub
+                elif sub.type == "do_block":
+                    do_block = sub
+            if arguments is None:
+                return False
+            fn_name, params = self._elixir_function_name_and_params(
+                arguments, source,
+            )
+            if fn_name is None:
+                return False
+            is_test = _is_test_function(fn_name, file_path)
+            kind = "Test" if is_test else "Function"
+            qualified = self._qualify(fn_name, file_path, enclosing_class)
+            nodes.append(NodeInfo(
+                kind=kind,
+                name=fn_name,
+                file_path=file_path,
+                line_start=node.start_point[0] + 1,
+                line_end=node.end_point[0] + 1,
+                language=language,
+                parent_name=enclosing_class,
+                params=params,
+                is_test=is_test,
+            ))
+            container = (
+                self._qualify(enclosing_class, file_path, None)
+                if enclosing_class else file_path
+            )
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=container,
+                target=qualified,
+                file_path=file_path,
+                line=node.start_point[0] + 1,
+            ))
+            if do_block is not None:
+                self._extract_from_tree(
+                    do_block, source, language, file_path, nodes, edges,
+                    enclosing_class=enclosing_class,
+                    enclosing_func=fn_name,
+                    import_map=import_map, defined_names=defined_names,
+                    _depth=_depth + 1,
+                )
+            return True
+
+        # ---- alias / import / require / use ----------------------------
+        if ident in ("alias", "import", "require", "use"):
+            for sub in node.children:
+                if sub.type == "arguments":
+                    mod = self._elixir_module_name(sub)
+                    if mod is not None:
+                        edges.append(EdgeInfo(
+                            kind="IMPORTS_FROM",
+                            source=file_path,
+                            target=mod,
+                            file_path=file_path,
+                            line=node.start_point[0] + 1,
+                        ))
+                    break
+            return True
+
+        # ---- Everything else = a regular function/method call ----------
+        # Module-scope calls attribute to the File node (same rule as the
+        # generic _extract_calls path).
+        # For dotted calls like `IO.puts(msg)`, prefer the dotted
+        # identifier; for bare calls use the first identifier.
+        call_name = ident
+        caller = (
+            self._qualify(enclosing_func, file_path, enclosing_class)
+            if enclosing_func
+            else file_path
+        )
+        target = self._resolve_call_target(
+            call_name, file_path, language,
+            import_map or {}, defined_names or set(),
+        )
+        edges.append(EdgeInfo(
+            kind="CALLS",
+            source=caller,
+            target=target,
+            file_path=file_path,
+            line=node.start_point[0] + 1,
+        ))
+        # Recurse into arguments + do_block so nested calls are caught.
+        for sub in node.children:
+            if sub.type in ("arguments", "do_block"):
+                self._extract_from_tree(
+                    sub, source, language, file_path, nodes, edges,
+                    enclosing_class=enclosing_class,
+                    enclosing_func=enclosing_func,
+                    import_map=import_map, defined_names=defined_names,
+                    _depth=_depth + 1,
+                )
+        return True
+
+    def _extract_bash_source_command(
+        self,
+        node,
+        file_path: str,
+        edges: list[EdgeInfo],
+    ) -> bool:
+        """Detect ``source foo.sh`` / ``. foo.sh`` and emit an IMPORTS_FROM
+        edge. Returns True if handled (so the main loop skips recursing
+        into this command). See: #197
+        """
+        command_name: Optional[str] = None
+        args: list[str] = []
+        for sub in node.children:
+            if sub.type == "command_name":
+                command_name = sub.text.decode("utf-8", errors="replace").strip()
+            elif sub.type in ("word", "string", "raw_string") and command_name:
+                txt = sub.text.decode("utf-8", errors="replace").strip()
+                # Strip surrounding quotes if present
+                if len(txt) >= 2 and txt[0] in ("'", '"') and txt[-1] == txt[0]:
+                    txt = txt[1:-1]
+                if txt:
+                    args.append(txt)
+        if command_name in ("source", ".") and args:
+            target = args[0]
+            # Try to resolve relative paths to real files
+            resolved = self._resolve_module_to_file(target, file_path, "bash")
+            edges.append(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=file_path,
+                target=resolved if resolved else target,
+                file_path=file_path,
+                line=node.start_point[0] + 1,
+            ))
+            return True
+        return False
+
+    def _extract_dart_calls_from_children(
+        self,
+        parent,
+        source: bytes,
+        file_path: str,
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+    ) -> None:
+        """Detect Dart call sites from a parent node's children (#87 bug 1).
+
+        tree-sitter-dart does not emit a single ``call_expression`` node for
+        Dart calls.  Instead it produces ``identifier`` / method-selector
+        siblings followed by a ``selector`` whose child is ``argument_part``:
+
+            identifier "print"
+            selector
+              argument_part
+
+        And for method calls like ``obj.foo()`` the middle selector is a
+        ``unconditional_assignable_selector`` holding the method name:
+
+            identifier "obj"
+            selector
+              unconditional_assignable_selector "."
+                identifier "foo"
+            selector
+              argument_part
+
+        This walker scans the immediate children of ``parent`` for either
+        shape and emits a ``CALLS`` edge.  Nested calls are picked up as
+        ``_extract_from_tree`` recurses into child nodes.
+        """
+        call_name: Optional[str] = None
+        for sub in parent.children:
+            if sub.type == "identifier":
+                call_name = sub.text.decode("utf-8", errors="replace")
+                continue
+            if sub.type == "selector":
+                # Case A: selector > unconditional_assignable_selector > identifier
+                # (updates call_name to the method name)
+                method_name: Optional[str] = None
+                has_arguments = False
+                for ssub in sub.children:
+                    if ssub.type == "unconditional_assignable_selector":
+                        for ident in ssub.children:
+                            if ident.type == "identifier":
+                                method_name = ident.text.decode(
+                                    "utf-8", errors="replace"
+                                )
+                                break
+                    elif ssub.type == "argument_part":
+                        has_arguments = True
+                if method_name is not None:
+                    call_name = method_name
+                if has_arguments and call_name:
+                    src_qn = (
+                        self._qualify(enclosing_func, file_path, enclosing_class)
+                        if enclosing_func else file_path
+                    )
+                    edges.append(EdgeInfo(
+                        kind="CALLS",
+                        source=src_qn,
+                        target=call_name,
+                        file_path=file_path,
+                        line=parent.start_point[0] + 1,
+                    ))
+                    # After emitting for this call, clear call_name so we
+                    # don't re-emit on any trailing chained selector.
+                    call_name = None
+                continue
+            # Non-identifier, non-selector children don't change the
+            # pending call name (``return``, ``await``, ``yield``, etc.)
+            # but anything unexpected should reset it to avoid spurious
+            # edges across unrelated siblings.
+            if sub.type not in ("return", "await", "yield", "this", "const", "new"):
+                call_name = None
 
     def _extract_r_constructs(
         self,
@@ -1488,6 +2242,22 @@ class CodeParser:
         if not name:
             return False
 
+        # Swift: detect the actual type keyword (class/struct/enum/actor/extension)
+        # and store it in extra["swift_kind"] for richer downstream analysis.
+        # Tree-sitter maps struct/enum/actor/extension all to class_declaration;
+        # protocol uses its own protocol_declaration node type.
+        extra: dict = {}
+        if language == "swift":
+            if child.type == "class_declaration":
+                _swift_keywords = {"class", "struct", "enum", "actor", "extension"}
+                for kw_child in child.children:
+                    kw_text = kw_child.text.decode("utf-8", errors="replace")
+                    if kw_text in _swift_keywords:
+                        extra["swift_kind"] = kw_text
+                        break
+            elif child.type == "protocol_declaration":
+                extra["swift_kind"] = "protocol"
+
         node = NodeInfo(
             kind="Class",
             name=name,
@@ -1496,6 +2266,7 @@ class CodeParser:
             line_end=child.end_point[0] + 1,
             language=language,
             parent_name=enclosing_class,
+            extra=extra,
         )
         nodes.append(node)
 
@@ -1550,6 +2321,14 @@ class CodeParser:
         name = self._get_name(child, language, "function")
         if not name:
             return False
+
+        # Go methods: attach to their receiver type as the enclosing class,
+        # so `func (s *T) Foo()` becomes a member of T rather than a
+        # top-level function. See: #190
+        if language == "go" and child.type == "method_declaration":
+            receiver_type = self._get_go_receiver_type(child)
+            if receiver_type:
+                enclosing_class = receiver_type
 
         # Extract annotations/decorators for test detection
         decorators: tuple[str, ...] = ()
@@ -1743,9 +2522,17 @@ class CodeParser:
             )
             return True
 
-        if call_name and enclosing_func:
-            caller = self._qualify(
-                enclosing_func, file_path, enclosing_class,
+        if call_name:
+            # Module-scope calls (no enclosing function) are attributed to
+            # the File node. Matches the existing convention for CONTAINS
+            # edges and _extract_value_references. Without this fallback,
+            # any function called only from top-level script glue, CLI
+            # entrypoints, or Jupyter/Databricks notebook cells is flagged
+            # as dead by find_dead_code.
+            caller = (
+                self._qualify(enclosing_func, file_path, enclosing_class)
+                if enclosing_func
+                else file_path
             )
             target = self._resolve_call_target(
                 call_name, file_path, language,
@@ -1760,6 +2547,302 @@ class CodeParser:
             ))
 
         return False
+
+    def _extract_jsx_component_call(
+        self,
+        child,
+        language: str,
+        file_path: str,
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+    ) -> None:
+        """Emit a synthetic CALLS edge for JSX component usage.
+
+        React-style component invocations use JSX rather than ``call_expression``.
+        Treat uppercase component tags such as ``<MarkdownMsg />`` as call-like
+        edges so caller/impact queries can cross the JSX boundary. Intrinsic DOM
+        tags (``<div>``) are ignored.
+
+        Module-scope JSX (e.g. a top-level ``<App />`` render call) attributes
+        to the File node.
+        """
+        target = self._resolve_jsx_component_target(
+            child, language, file_path, import_map or {}, defined_names or set(),
+        )
+        if not target:
+            return
+
+        caller = (
+            self._qualify(enclosing_func, file_path, enclosing_class)
+            if enclosing_func
+            else file_path
+        )
+        edges.append(EdgeInfo(
+            kind="CALLS",
+            source=caller,
+            target=target,
+            file_path=file_path,
+            line=child.start_point[0] + 1,
+        ))
+
+    def _resolve_jsx_component_target(
+        self,
+        node,
+        language: str,
+        file_path: str,
+        import_map: dict[str, str],
+        defined_names: set[str],
+    ) -> Optional[str]:
+        """Resolve a JSX component element to a call target."""
+        component_ref = self._get_jsx_component_reference(node)
+        if component_ref is None:
+            return None
+
+        base_name, component_name = component_ref
+        if base_name is None:
+            return self._resolve_call_target(
+                component_name, file_path, language, import_map, defined_names,
+            )
+
+        if base_name in import_map:
+            resolved = self._resolve_imported_symbol(
+                component_name, import_map[base_name], file_path, language,
+            )
+            if resolved:
+                return resolved
+
+        return component_name
+
+    # ------------------------------------------------------------------
+    # Value-reference extraction (function-as-value patterns)
+    # ------------------------------------------------------------------
+
+    # AST node types that represent object literal key-value pairs.
+    _PAIR_TYPES = frozenset({"pair"})
+
+    # AST node types for array/list containers.
+    _ARRAY_TYPES = frozenset({"array", "list"})
+
+    # Names that are almost certainly not function references (constants,
+    # common primitives).  All-uppercase identifiers and very short names
+    # are excluded by a length/casing heuristic in the method itself.
+    _VALUE_REF_SKIP_NAMES = frozenset({
+        "true", "false", "null", "undefined", "None", "True", "False",
+        "self", "this", "cls", "super",
+    })
+
+    def _extract_value_references(
+        self,
+        child,
+        node_type: str,
+        source: bytes,
+        language: str,
+        file_path: str,
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+    ) -> None:
+        """Emit ``REFERENCES`` edges for function-as-value patterns.
+
+        Detects identifiers in value positions that likely refer to
+        functions — object literal values, map property assignments,
+        array elements, and callback arguments.  This reduces false
+        positives in dead-code detection for dispatch-map patterns
+        like ``Record<string, Handler>``.
+
+        Only emits edges when the identifier matches a locally defined
+        name or an imported symbol, avoiding noise from arbitrary
+        variable references.
+        """
+        imap = import_map or {}
+        dnames = defined_names or set()
+
+        # Use enclosing function as source, or the file path for module-scope code.
+        if enclosing_func:
+            caller = self._qualify(enclosing_func, file_path, enclosing_class)
+        else:
+            caller = file_path
+
+        # --- JS/TS/Python: object literal pair values  { key: fnRef } ---
+        if node_type in self._PAIR_TYPES:
+            self._ref_from_pair(child, source, language, file_path, caller, edges, imap, dnames)
+            return
+
+        # --- JS/TS: shorthand property identifiers  { fnRef } ---
+        if (
+            node_type == "shorthand_property_identifier"
+            and language in ("javascript", "typescript", "tsx")
+        ):
+            name = child.text.decode("utf-8", errors="replace")
+            self._emit_reference_if_known(
+                name, language, file_path, caller, edges, imap, dnames,
+                line=child.start_point[0] + 1,
+            )
+            return
+
+        # --- JS/TS/Python: assignment with member/subscript LHS ---
+        if node_type in ("assignment_expression", "augmented_assignment", "assignment"):
+            self._ref_from_assignment(
+                child, source, language, file_path, caller, edges, imap, dnames,
+            )
+            return
+
+        # --- JS/TS/Python: array / list elements ---
+        if node_type in self._ARRAY_TYPES:
+            self._ref_from_array(child, source, language, file_path, caller, edges, imap, dnames)
+            return
+
+        # --- Callback arguments (identifier args inside call_expression) ---
+        if node_type == "arguments":
+            self._ref_from_arguments(
+                child, source, language, file_path, caller, edges, imap, dnames,
+            )
+
+    def _emit_reference_if_known(
+        self,
+        name: str,
+        language: str,
+        file_path: str,
+        caller: str,
+        edges: list[EdgeInfo],
+        import_map: dict[str, str],
+        defined_names: set[str],
+        line: int = 0,
+    ) -> None:
+        """Emit a ``REFERENCES`` edge if *name* is a known function/import."""
+        if not name or name in self._VALUE_REF_SKIP_NAMES:
+            return
+        # Skip all-uppercase names (likely constants) and single-char names.
+        if name.isupper() or len(name) <= 1:
+            return
+        # Must be a known local definition or import to be worth tracking.
+        if name not in defined_names and name not in import_map:
+            return
+
+        target = self._resolve_call_target(
+            name, file_path, language, import_map, defined_names,
+        )
+        edges.append(EdgeInfo(
+            kind="REFERENCES",
+            source=caller,
+            target=target,
+            file_path=file_path,
+            line=line,
+        ))
+
+    def _ref_from_pair(
+        self,
+        pair_node,
+        source: bytes,
+        language: str,
+        file_path: str,
+        caller: str,
+        edges: list[EdgeInfo],
+        import_map: dict[str, str],
+        defined_names: set[str],
+    ) -> None:
+        """Extract a REFERENCES edge from an object/dict literal pair value."""
+        # pair children: key, ":", value
+        children = pair_node.children
+        # Find the value — it's the last meaningful child.
+        value_node = None
+        for ch in reversed(children):
+            if ch.type not in (":", ",", "comment"):
+                value_node = ch
+                break
+        if value_node is None:
+            return
+        if value_node.type == "identifier":
+            name = value_node.text.decode("utf-8", errors="replace")
+            self._emit_reference_if_known(
+                name, language, file_path, caller, edges,
+                import_map, defined_names,
+                line=value_node.start_point[0] + 1,
+            )
+
+    def _ref_from_assignment(
+        self,
+        assign_node,
+        source: bytes,
+        language: str,
+        file_path: str,
+        caller: str,
+        edges: list[EdgeInfo],
+        import_map: dict[str, str],
+        defined_names: set[str],
+    ) -> None:
+        """Extract REFERENCES from ``obj.key = fnRef`` or ``obj['key'] = fnRef``."""
+        children = assign_node.children
+        if len(children) < 3:
+            return
+        lhs = children[0]
+        # LHS must be a member_expression or subscript_expression (map assignment).
+        if lhs.type not in (
+            "member_expression", "subscript_expression",
+            "attribute", "subscript",
+        ):
+            return
+        # RHS is the last non-punctuation child.
+        rhs = None
+        for ch in reversed(children):
+            if ch.type not in ("=", ":", ",", "comment", "type_annotation"):
+                rhs = ch
+                break
+        if rhs is None or rhs.type != "identifier":
+            return
+        name = rhs.text.decode("utf-8", errors="replace")
+        self._emit_reference_if_known(
+            name, language, file_path, caller, edges,
+            import_map, defined_names,
+            line=rhs.start_point[0] + 1,
+        )
+
+    def _ref_from_array(
+        self,
+        array_node,
+        source: bytes,
+        language: str,
+        file_path: str,
+        caller: str,
+        edges: list[EdgeInfo],
+        import_map: dict[str, str],
+        defined_names: set[str],
+    ) -> None:
+        """Extract REFERENCES from array/list elements that are identifiers."""
+        for ch in array_node.children:
+            if ch.type == "identifier":
+                name = ch.text.decode("utf-8", errors="replace")
+                self._emit_reference_if_known(
+                    name, language, file_path, caller, edges,
+                    import_map, defined_names,
+                    line=ch.start_point[0] + 1,
+                )
+
+    def _ref_from_arguments(
+        self,
+        args_node,
+        source: bytes,
+        language: str,
+        file_path: str,
+        caller: str,
+        edges: list[EdgeInfo],
+        import_map: dict[str, str],
+        defined_names: set[str],
+    ) -> None:
+        """Extract REFERENCES from identifier arguments (callbacks)."""
+        for ch in args_node.children:
+            if ch.type == "identifier":
+                name = ch.text.decode("utf-8", errors="replace")
+                self._emit_reference_if_known(
+                    name, language, file_path, caller, edges,
+                    import_map, defined_names,
+                    line=ch.start_point[0] + 1,
+                )
 
     def _extract_solidity_constructs(
         self,
@@ -1777,15 +2860,20 @@ class CodeParser:
         Returns True if the child was fully handled and should skip
         default recursion.
         """
-        # Emit statements: emit EventName(...) -> CALLS edge
-        if node_type == "emit_statement" and enclosing_func:
+        # Emit statements: emit EventName(...) -> CALLS edge.
+        # Module-scope emits attribute to the File node.
+        if node_type == "emit_statement":
             for sub in child.children:
                 if sub.type == "expression":
                     for ident in sub.children:
                         if ident.type == "identifier":
-                            caller = self._qualify(
-                                enclosing_func, file_path,
-                                enclosing_class,
+                            caller = (
+                                self._qualify(
+                                    enclosing_func, file_path,
+                                    enclosing_class,
+                                )
+                                if enclosing_func
+                                else file_path
                             )
                             edges.append(EdgeInfo(
                                 kind="CALLS",
@@ -1954,6 +3042,14 @@ class CodeParser:
                     if inner.type in func_types or inner.type in class_types:
                         target = inner
                         break
+            elif (
+                language in ("javascript", "typescript", "tsx")
+                and node_type == "export_statement"
+            ):
+                for inner in child.children:
+                    if inner.type in func_types or inner.type in class_types:
+                        target = inner
+                        break
 
             target_type = target.type
 
@@ -1975,12 +3071,34 @@ class CodeParser:
                                       "class" if target_type in class_types else "function")
                 if name:
                     defined_names.add(name)
+                    continue
+
+            if (
+                language in ("javascript", "typescript", "tsx")
+                and node_type == "export_statement"
+            ):
+                self._collect_js_exported_local_names(child, defined_names)
 
             # Collect import mappings: imported_name → module_path
             if node_type in import_types:
                 self._collect_import_names(child, language, source, import_map)
 
         return import_map, defined_names
+
+    def _collect_js_exported_local_names(
+        self, node, defined_names: set[str],
+    ) -> None:
+        """Collect locally exported JS/TS names from export statements."""
+        for child in node.children:
+            if child.type in ("lexical_declaration", "variable_declaration"):
+                for sub in child.children:
+                    if sub.type == "variable_declarator":
+                        for part in sub.children:
+                            if part.type == "identifier":
+                                defined_names.add(
+                                    part.text.decode("utf-8", errors="replace"),
+                                )
+                                break
 
     def _collect_import_names(
         self, node, language: str, source: bytes, import_map: dict[str, str],
@@ -2030,6 +3148,11 @@ class CodeParser:
             if child.type == "identifier":
                 # Default import
                 import_map[child.text.decode("utf-8", errors="replace")] = module
+            elif child.type == "namespace_import":
+                for sub in child.children:
+                    if sub.type == "identifier":
+                        import_map[sub.text.decode("utf-8", errors="replace")] = module
+                        break
             elif child.type == "named_imports":
                 for spec in child.children:
                     if spec.type == "import_specifier":
@@ -2066,6 +3189,17 @@ class CodeParser:
     ) -> Optional[str]:
         """Language-aware module-to-file resolution."""
         caller_dir = Path(file_path).parent
+
+        if language == "bash":
+            # ``source ./lib.sh`` or ``source lib.sh`` — resolve relative
+            # to the caller's directory. See: #197
+            try:
+                target = (caller_dir / module).resolve()
+                if target.is_file():
+                    return str(target)
+            except (OSError, ValueError):
+                pass
+            return None
 
         if language == "python":
             rel_path = module.replace(".", "/")
@@ -2116,7 +3250,90 @@ class CodeParser:
                 target = base.with_suffix(".dart")
                 if target.is_file():
                     return str(target.resolve())
+            elif module.startswith("package:"):
+                # ``package:<name>/<sub_path>`` — resolve to the current repo's
+                # ``lib/<sub_path>`` iff a ``pubspec.yaml`` declaring that
+                # package name is found in an ancestor directory. See: #87
+                try:
+                    uri_body = module[len("package:"):]
+                    pkg_name, _, sub_path = uri_body.partition("/")
+                    if not sub_path:
+                        return None
+                    pubspec_root = self._find_dart_pubspec_root(
+                        caller_dir, pkg_name
+                    )
+                    if pubspec_root is not None:
+                        target = pubspec_root / "lib" / sub_path
+                        if target.is_file():
+                            return str(target.resolve())
+                except (OSError, ValueError):
+                    return None
+            # ``dart:core`` / ``dart:async`` etc. are SDK libraries we do
+            # not track; fall through to return None.
 
+        elif language == "java":
+            # ``import com.example.pkg.ClassName;`` — convert dot-notation
+            # to a relative path and walk up from the caller's directory to
+            # find the source root.  Wildcards (``import pkg.*``) and static
+            # member imports (``import static pkg.Class.member``) that don't
+            # resolve as-is are retried after dropping the last segment
+            # (the member name).
+            if module.endswith(".*"):
+                return None  # wildcard import — can't resolve to one file
+            rel_path = module.replace(".", "/") + ".java"
+            current = caller_dir
+            while True:
+                target = current / rel_path
+                if target.is_file():
+                    return str(target.resolve())
+                if current == current.parent:
+                    break
+                current = current.parent
+            # Static import: ``pkg.Class.member`` — strip member, try again
+            dot = module.rfind(".")
+            if dot > 0:
+                class_module = module[:dot]
+                rel_path2 = class_module.replace(".", "/") + ".java"
+                current = caller_dir
+                while True:
+                    target = current / rel_path2
+                    if target.is_file():
+                        return str(target.resolve())
+                    if current == current.parent:
+                        break
+                    current = current.parent
+
+        return None
+
+    def _find_dart_pubspec_root(
+        self, start: Path, pkg_name: str,
+    ) -> Optional[Path]:
+        """Walk up from ``start`` to find a ``pubspec.yaml`` whose ``name:``
+        matches ``pkg_name``. Returns the directory containing that pubspec,
+        or None if no match is found. Result is cached per (start, pkg_name)
+        pair so repeated lookups within one parse pass are cheap.
+        """
+        cache_key = (str(start), pkg_name)
+        cached = self._dart_pubspec_cache.get(cache_key)
+        if cached is not None or cache_key in self._dart_pubspec_cache:
+            return cached
+        current = start
+        # Avoid infinite loops on weird symlinks.
+        for _ in range(20):
+            pubspec = current / "pubspec.yaml"
+            if pubspec.is_file():
+                try:
+                    text = pubspec.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    text = ""
+                m = re.search(r"^name:\s*([\w-]+)", text, re.MULTILINE)
+                if m and m.group(1) == pkg_name:
+                    self._dart_pubspec_cache[cache_key] = current
+                    return current
+            if current.parent == current:
+                break
+            current = current.parent
+        self._dart_pubspec_cache[cache_key] = None
         return None
 
     def _resolve_call_target(
@@ -2131,12 +3348,134 @@ class CodeParser:
         if call_name in defined_names:
             return self._qualify(call_name, file_path, None)
         if call_name in import_map:
-            resolved = self._resolve_module_to_file(
-                import_map[call_name], file_path, language,
+            resolved = self._resolve_imported_symbol(
+                call_name, import_map[call_name], file_path, language,
             )
             if resolved:
-                return self._qualify(call_name, resolved, None)
+                return resolved
         return call_name
+
+    def _resolve_imported_symbol(
+        self,
+        symbol_name: str,
+        module: str,
+        file_path: str,
+        language: str,
+    ) -> Optional[str]:
+        """Resolve an imported symbol to its defining qualified name when possible."""
+        resolved = self._resolve_module_to_file(module, file_path, language)
+        if not resolved:
+            return None
+
+        export_target = self._resolve_exported_symbol(resolved, symbol_name)
+        if export_target:
+            return export_target
+        return self._qualify(symbol_name, resolved, None)
+
+    def _resolve_exported_symbol(
+        self,
+        module_file: str,
+        symbol_name: str,
+        seen: Optional[set[tuple[str, str]]] = None,
+    ) -> Optional[str]:
+        """Resolve a JS/TS symbol through common re-export/barrel patterns."""
+        cache_key = f"{module_file}::{symbol_name}"
+        if cache_key in self._export_symbol_cache:
+            return self._export_symbol_cache[cache_key]
+
+        key = (module_file, symbol_name)
+        if seen is None:
+            seen = set()
+        if key in seen:
+            return None
+        seen.add(key)
+
+        path = Path(module_file)
+        language = self.detect_language(path)
+        if language not in ("javascript", "typescript", "tsx", "vue"):
+            return None
+
+        try:
+            source = path.read_bytes()
+        except (OSError, PermissionError):
+            return None
+
+        parser = self._get_parser(language)
+        if not parser:
+            return None
+
+        tree = parser.parse(source)
+
+        # Direct local definition/export in the module file.
+        import_map, defined_names = self._collect_file_scope(
+            tree.root_node, language, source,
+        )
+        if symbol_name in defined_names:
+            result = self._qualify(symbol_name, module_file, None)
+            self._export_symbol_cache[cache_key] = result
+            return result
+
+        for child in tree.root_node.children:
+            if child.type != "export_statement":
+                continue
+
+            export_clause = None
+            target_module = None
+            has_star_export = False
+
+            for sub in child.children:
+                if sub.type == "export_clause":
+                    export_clause = sub
+                elif sub.type == "string":
+                    target_module = sub.text.decode("utf-8", errors="replace").strip("'\"")
+                elif sub.type == "*":
+                    has_star_export = True
+
+            # Re-exported names: export { Foo as Bar } from './x'
+            if export_clause is not None:
+                for spec in export_clause.children:
+                    if spec.type != "export_specifier":
+                        continue
+                    names = [
+                        part.text.decode("utf-8", errors="replace")
+                        for part in spec.children
+                        if part.type in ("identifier", "property_identifier")
+                    ]
+                    if not names:
+                        continue
+                    exported_name = names[-1]
+                    original_name = names[0]
+                    if exported_name != symbol_name:
+                        continue
+                    if target_module:
+                        resolved_module = self._resolve_module_to_file(
+                            target_module, module_file, language,
+                        )
+                        if resolved_module:
+                            result = self._resolve_exported_symbol(
+                                resolved_module, original_name, seen,
+                            ) or self._qualify(original_name, resolved_module, None)
+                            self._export_symbol_cache[cache_key] = result
+                            return result
+                    result = self._qualify(original_name, module_file, None)
+                    self._export_symbol_cache[cache_key] = result
+                    return result
+
+            # Star re-export: export * from './x'
+            if has_star_export and target_module:
+                resolved_module = self._resolve_module_to_file(
+                    target_module, module_file, language,
+                )
+                if resolved_module:
+                    result = self._resolve_exported_symbol(
+                        resolved_module, symbol_name, seen,
+                    )
+                    if result:
+                        self._export_symbol_cache[cache_key] = result
+                        return result
+
+        self._export_symbol_cache[cache_key] = None
+        return None
 
     def _qualify(self, name: str, file_path: str, enclosing_class: Optional[str]) -> str:
         """Create a qualified name: file_path::ClassName.name or file_path::name."""
@@ -2161,11 +3500,11 @@ class CodeParser:
                 for child in node.children:
                     if child.type in ("receive", "fallback"):
                         return child.text.decode("utf-8", errors="replace")
-        # Lua: function_declaration names may be dot_index_expression or
+        # Lua/Luau: function_declaration names may be dot_index_expression or
         # method_index_expression (e.g. function Animal.new() / Animal:speak()).
         # Return only the method name; the table name is used as parent_name
         # in _extract_lua_constructs.
-        if language == "lua" and node.type == "function_declaration":
+        if language in ("lua", "luau") and node.type == "function_declaration":
             for child in node.children:
                 if child.type in ("dot_index_expression", "method_index_expression"):
                     # Last identifier child is the method name
@@ -2180,14 +3519,57 @@ class CodeParser:
                     return child.text.decode("utf-8", errors="replace")
                 if child.type == "package" and child.text != b"package":
                     return child.text.decode("utf-8", errors="replace")
-        # For C/C++: function names are inside function_declarator/pointer_declarator
-        # Check these first to avoid matching the return type_identifier
-        if language in ("c", "cpp") and kind == "function":
+        # For C/C++/Objective-C: function names are inside
+        # function_declarator / pointer_declarator. Check these first to
+        # avoid matching the return type_identifier as the function name.
+        if language in ("c", "cpp", "objc") and kind == "function":
             for child in node.children:
                 if child.type in ("function_declarator", "pointer_declarator"):
                     result = self._get_name(child, language, kind)
                     if result:
                         return result
+
+        # Objective-C method_definition: the method name is the first
+        # ``identifier`` child (first part of the selector). Multi-part
+        # selectors like ``- (void)add:(int)a to:(int)b`` keep ``add`` as
+        # the canonical method name; later parts are keyword arguments.
+        if language == "objc" and node.type == "method_definition":
+            for child in node.children:
+                if child.type == "identifier":
+                    return child.text.decode("utf-8", errors="replace")
+
+        # Bash function_definition: ``foo() { ... }`` — tree-sitter-bash
+        # stores the function name as a ``word`` child, which the generic
+        # loop below doesn't recognize.
+        if language == "bash" and node.type == "function_definition":
+            for child in node.children:
+                if child.type == "word":
+                    return child.text.decode("utf-8", errors="replace")
+        # Go methods: tree-sitter-go uses field_identifier for the name
+        # (e.g. func (s *T) MethodName(...) { }). Must run before the generic
+        # loop, which would match the result type's type_identifier (e.g. int64).
+        if language == "go" and node.type == "method_declaration":
+            for child in node.children:
+                if child.type == "field_identifier":
+                    return child.text.decode("utf-8", errors="replace")
+        # Java methods: tree-sitter-java puts type_identifier or generic_type
+        # (return type) before identifier (method name).  Must run before
+        # the generic loop, which would match the return type's
+        # type_identifier (e.g. "String", "ConfigBean").
+        # Constructors are fine — they have no return type node.
+        # Kotlin is unaffected: its syntax places the name before the type.
+        if language == "java" and node.type == "method_declaration":
+            for child in node.children:
+                if child.type == "identifier":
+                    return child.text.decode("utf-8", errors="replace")
+        # Swift extensions: name is inside user_type > type_identifier
+        # (e.g. `extension MyClass: Protocol { ... }`)
+        if language == "swift" and node.type == "class_declaration":
+            for child in node.children:
+                if child.type == "user_type":
+                    for sub in child.children:
+                        if sub.type == "type_identifier":
+                            return sub.text.decode("utf-8", errors="replace")
         # Most languages use a 'name' child
         for child in node.children:
             if child.type in (
@@ -2200,6 +3582,36 @@ class CodeParser:
             for child in node.children:
                 if child.type == "type_spec":
                     return self._get_name(child, language, kind)
+        return None
+
+    def _get_go_receiver_type(self, node) -> Optional[str]:
+        """Extract the receiver type from a Go method_declaration.
+
+        For ``func (s *T) Foo() {...}`` returns ``"T"``. For ``func (T) Foo()``
+        also returns ``"T"``. Returns None if no receiver is present.
+
+        The receiver is always the first ``parameter_list`` child of a
+        Go ``method_declaration`` and contains a single ``parameter_declaration``
+        whose type is either a ``type_identifier`` or a ``pointer_type``
+        wrapping one. See: #190
+        """
+        for child in node.children:
+            if child.type != "parameter_list":
+                continue
+            for param in child.children:
+                if param.type != "parameter_declaration":
+                    continue
+                for sub in param.children:
+                    if sub.type == "type_identifier":
+                        return sub.text.decode("utf-8", errors="replace")
+                    if sub.type == "pointer_type":
+                        for ptr_child in sub.children:
+                            if ptr_child.type == "type_identifier":
+                                return ptr_child.text.decode(
+                                    "utf-8", errors="replace"
+                                )
+            # First parameter_list is always the receiver; stop searching.
+            return None
         return None
 
     def _get_params(self, node, language: str, source: bytes) -> Optional[str]:
@@ -2243,7 +3655,23 @@ class CodeParser:
                     for arg in child.children:
                         if arg.type in ("identifier", "attribute"):
                             bases.append(arg.text.decode("utf-8", errors="replace"))
-        elif language in ("java", "csharp", "kotlin"):
+        elif language == "java":
+            # Java: superclass and super_interfaces wrap the keyword
+            # (extends/implements) around type_identifier children.
+            # Taking .text would include the keyword (e.g. "implements Foo").
+            # Drill into the children to extract bare type names.
+            for child in node.children:
+                if child.type == "superclass":
+                    for sub in child.children:
+                        if sub.type in ("type_identifier", "generic_type"):
+                            bases.append(sub.text.decode("utf-8", errors="replace"))
+                elif child.type == "super_interfaces":
+                    for sub in child.children:
+                        if sub.type == "type_list":
+                            for ident in sub.children:
+                                if ident.type in ("type_identifier", "generic_type"):
+                                    bases.append(ident.text.decode("utf-8", errors="replace"))
+        elif language in ("csharp", "kotlin"):
             # Look for superclass/interfaces in extends/implements clauses
             for child in node.children:
                 if child.type in (
@@ -2317,6 +3745,19 @@ class CodeParser:
                     for sub in child.children:
                         if sub.type == "type_identifier":
                             bases.append(sub.text.decode("utf-8", errors="replace"))
+        elif language == "swift":
+            # Swift: class Foo: Bar, Baz { ... } / extension Foo: Protocol { ... }
+            # AST: inheritance_specifier > user_type > type_identifier
+            for child in node.children:
+                if child.type == "inheritance_specifier":
+                    for sub in child.children:
+                        if sub.type == "user_type":
+                            for ident in sub.children:
+                                if ident.type == "type_identifier":
+                                    bases.append(
+                                        ident.text.decode("utf-8", errors="replace")
+                                    )
+                                    break
         return bases
 
     def _extract_import(self, node, language: str, source: bytes) -> list[str]:
@@ -2430,6 +3871,25 @@ class CodeParser:
             val = _find_string_literal(node)
             if val:
                 imports.append(val)
+        elif language == "gdscript":
+            # ``extends Node`` → type > identifier("Node")
+            # ``extends "res://path.gd"`` → string literal
+            # ``extends SomeClass.Nested`` → type node (keep full text)
+            for child in node.children:
+                if child.type == "type":
+                    txt = child.text.decode("utf-8", errors="replace").strip()
+                    if txt:
+                        imports.append(txt)
+                elif child.type == "string":
+                    val = child.text.decode("utf-8", errors="replace").strip("'\"")
+                    if val:
+                        imports.append(val)
+                elif child.type == "identifier":
+                    # Fallback: some grammar variants expose the parent type as
+                    # a bare identifier next to the ``extends`` keyword.
+                    txt = child.text.decode("utf-8", errors="replace")
+                    if txt and txt != "extends":
+                        imports.append(txt)
         else:
             # Fallback: just record the text
             imports.append(text)
@@ -2443,11 +3903,71 @@ class CodeParser:
 
         first = node.children[0]
 
+        if language == "php":
+            def _normalize_php_name(text: str) -> str:
+                # PHP global/function names can be prefixed with '\\'.
+                return text.lstrip("\\")
+
+            if node.type == "function_call_expression":
+                for child in node.children:
+                    if child.type in ("name", "qualified_name"):
+                        raw = child.text.decode("utf-8", errors="replace")
+                        return _normalize_php_name(raw)
+                return None
+
+            if node.type in (
+                "member_call_expression",
+                "nullsafe_member_call_expression",
+            ):
+                for child in reversed(node.children):
+                    if child.type == "name":
+                        return child.text.decode("utf-8", errors="replace")
+                return None
+
+            if node.type == "scoped_call_expression":
+                parts = []
+                for child in node.children:
+                    if child.type in ("name", "qualified_name"):
+                        raw = child.text.decode("utf-8", errors="replace")
+                        parts.append(_normalize_php_name(raw))
+                if len(parts) >= 2:
+                    return f"{parts[0]}::{parts[-1]}"
+                if parts:
+                    return parts[0]
+                return None
+
         # Scala: instance_expression (new Foo(...)) – extract the type name
         if node.type == "instance_expression":
             for child in node.children:
                 if child.type in ("type_identifier", "identifier"):
                     return child.text.decode("utf-8", errors="replace")
+            return None
+
+        # Objective-C: [receiver method:arg] — the method name is the
+        # SECOND identifier-like child (the first is the receiver). For
+        # multi-part selectors like `[obj add:a to:b]` we keep the first
+        # part (`add`) as the call name; later parts are keyword arguments.
+        if language == "objc" and node.type == "message_expression":
+            receiver_skipped = False
+            for child in node.children:
+                if child.type in ("[", "]"):
+                    continue
+                if not receiver_skipped:
+                    # First non-bracket child is the receiver (identifier,
+                    # message_expression for chained calls, etc.)
+                    receiver_skipped = True
+                    continue
+                if child.type == "identifier":
+                    return child.text.decode("utf-8", errors="replace")
+            return None
+
+        # Bash: `command` node's first child is the command name.
+        if language == "bash" and node.type == "command":
+            for child in node.children:
+                if child.type == "command_name":
+                    # command_name wraps a word — get its text
+                    txt = child.text.decode("utf-8", errors="replace").strip()
+                    return txt or None
             return None
 
         # Solidity wraps call targets in an 'expression' node – unwrap it
@@ -2470,9 +3990,9 @@ class CodeParser:
         if first.type == "function":
             return first.text.decode("utf-8", errors="replace")
 
-        # Lua: dot_index_expression (obj.method) and method_index_expression
+        # Lua/Luau: dot_index_expression (obj.method) and method_index_expression
         # (obj:method) — extract the rightmost identifier as the call name.
-        if language == "lua" and first.type in (
+        if language in ("lua", "luau") and first.type in (
             "dot_index_expression", "method_index_expression",
         ):
             for child in reversed(first.children):
@@ -2511,6 +4031,55 @@ class CodeParser:
             return first.text.decode("utf-8", errors="replace")
 
         return None
+
+    def _get_jsx_component_reference(self, node) -> Optional[tuple[Optional[str], str]]:
+        """Extract ``(base_name, component_name)`` for a JSX element.
+
+        ``base_name`` is set for member-style elements such as
+        ``<UI.MarkdownMsg />`` and ``None`` for plain component tags such as
+        ``<MarkdownMsg />``.
+        """
+        for child in node.children:
+            if child.type == "identifier":
+                name = child.text.decode("utf-8", errors="replace")
+                if self._looks_like_component_name(name):
+                    return (None, name)
+                return None
+            if child.type == "member_expression":
+                base_name = self._get_member_expression_root_name(child)
+                component_name = None
+                for sub in reversed(child.children):
+                    if sub.type in ("identifier", "property_identifier"):
+                        component_name = sub.text.decode("utf-8", errors="replace")
+                        break
+                if component_name and self._looks_like_component_name(component_name):
+                    return (base_name, component_name)
+                for sub in reversed(child.children):
+                    if sub.type in ("identifier", "property_identifier"):
+                        name = sub.text.decode("utf-8", errors="replace")
+                        if self._looks_like_component_name(name):
+                            return (None, name)
+                        return None
+                text = child.text.decode("utf-8", errors="replace")
+                tail = text.split(".")[-1]
+                if self._looks_like_component_name(tail):
+                    return (None, tail)
+                return None
+        return None
+
+    def _get_member_expression_root_name(self, node) -> Optional[str]:
+        """Return the leftmost identifier for a nested member expression."""
+        for child in node.children:
+            if child.type == "identifier":
+                return child.text.decode("utf-8", errors="replace")
+            if child.type == "member_expression":
+                return self._get_member_expression_root_name(child)
+        return None
+
+    @staticmethod
+    def _looks_like_component_name(name: str) -> bool:
+        """Return True for JSX names that look like user components."""
+        return bool(name) and name[0].isupper()
 
     # Modifier suffixes used in JS/TS test runners
     _TEST_MODIFIER_SUFFIXES = frozenset({
@@ -2703,21 +4272,25 @@ class CodeParser:
                 import_map, defined_names,
             )
 
-        if enclosing_func:
-            call_name = self._get_call_name(node, language, source)
-            if call_name:
-                caller = self._qualify(enclosing_func, file_path, enclosing_class)
-                target = self._resolve_call_target(
-                    call_name, file_path, language,
-                    import_map or {}, defined_names or set(),
-                )
-                edges.append(EdgeInfo(
-                    kind="CALLS",
-                    source=caller,
-                    target=target,
-                    file_path=file_path,
-                    line=node.start_point[0] + 1,
-                ))
+        # Module-scope R calls attribute to the File node.
+        call_name = self._get_call_name(node, language, source)
+        if call_name:
+            caller = (
+                self._qualify(enclosing_func, file_path, enclosing_class)
+                if enclosing_func
+                else file_path
+            )
+            target = self._resolve_call_target(
+                call_name, file_path, language,
+                import_map or {}, defined_names or set(),
+            )
+            edges.append(EdgeInfo(
+                kind="CALLS",
+                source=caller,
+                target=target,
+                file_path=file_path,
+                line=node.start_point[0] + 1,
+            ))
 
         self._extract_from_tree(
             node, source, language, file_path, nodes, edges,
