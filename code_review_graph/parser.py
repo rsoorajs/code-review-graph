@@ -4264,6 +4264,27 @@ class CodeParser:
                 role = "workflow_interface" if "WorkflowInterface" in temporal_roles else "activity_interface"
                 extra["temporal_role"] = role
 
+        # Collect class-level decorators / annotations (same shape as
+        # functions so flows._has_framework_decorator can match).
+        deco_list: list[str] = []
+        for sub in child.children:
+            if sub.type == "modifiers":
+                for mod in sub.children:
+                    if mod.type in ("annotation", "marker_annotation"):
+                        deco_list.append(
+                            mod.text.decode("utf-8", errors="replace")
+                            .lstrip("@").strip()
+                        )
+        if child.parent and child.parent.type == "decorated_definition":
+            for sib in child.parent.children:
+                if sib.type == "decorator":
+                    deco_list.append(
+                        sib.text.decode("utf-8", errors="replace")
+                        .lstrip("@").strip()
+                    )
+        if deco_list:
+            extra["decorators"] = deco_list
+
         node = NodeInfo(
             kind="Class",
             name=name,
@@ -4395,6 +4416,8 @@ class CodeParser:
                 self._emit_kafka_edges_from_method(
                     child, name, enclosing_class, file_path, edges,
                 )
+        if decorators:
+            method_extra["decorators"] = list(decorators)
 
         node = NodeInfo(
             kind=kind,
