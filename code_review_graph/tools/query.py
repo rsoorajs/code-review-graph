@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from ..embeddings import EmbeddingStore
-from ..graph import _sanitize_name, edge_to_dict, node_to_dict
+from ..graph import GraphNode, _sanitize_name, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
 from ..incremental import get_changed_files, get_db_path, get_staged_and_unstaged
 from ..search import hybrid_search
-from ._common import _BUILTIN_CALL_NAMES, _get_store
+from ._common import _BUILTIN_CALL_NAMES, _get_store, graph_meta
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,8 @@ def get_impact_radius(
                 f" of {total_impacted} impacted nodes"
             )
 
+        meta = graph_meta(store, root)
+
         if detail_level == "minimal":
             impacted_count = len(impacted_dicts)
             if impacted_count > 20:
@@ -104,9 +106,8 @@ def get_impact_radius(
                 risk = "medium"
             else:
                 risk = "low"
-            key_entities = [
-                n["name"] for n in impacted_dicts[:5]
-            ]
+            key_entities = [n["name"] for n in impacted_dicts[:5]]
+            nodes_omitted = max(0, total_impacted - len(impacted_dicts))
             return {
                 "status": "ok",
                 "summary": "\n".join(summary_parts),
@@ -114,6 +115,8 @@ def get_impact_radius(
                 "impacted_file_count": len(result["impacted_files"]),
                 "key_entities": key_entities,
                 "truncated": truncated,
+                "nodes_omitted": nodes_omitted,
+                "graph_meta": meta,
             }
 
         return {
@@ -126,6 +129,7 @@ def get_impact_radius(
             "edges": edge_dicts,
             "truncated": truncated,
             "total_impacted": total_impacted,
+            "graph_meta": meta,
         }
     finally:
         store.close()
@@ -136,11 +140,41 @@ def get_impact_radius(
 # ---------------------------------------------------------------------------
 
 
+def _rank_disambiguation_candidates(candidates: list[GraphNode], target: str) -> list[dict]:
+    """Rank disambiguation candidates by match quality and return enriched dicts.
+
+    Ranking: exact qualified_name match > exact name match > partial match.
+    Each entry includes qualified_name, name, kind, file_path, and line_start
+    so the agent can pick the right one without a follow-up call.
+    """
+    def _score(node: GraphNode) -> int:
+        if node.qualified_name == target:
+            return 0
+        if node.name == target:
+            return 1
+        if target.lower() in node.qualified_name.lower():
+            return 2
+        return 3
+
+    ranked = sorted(candidates, key=_score)
+    return [
+        {
+            "qualified_name": _sanitize_name(n.qualified_name),
+            "name": _sanitize_name(n.name),
+            "kind": n.kind,
+            "file_path": n.file_path,
+            "line_start": n.line_start,
+        }
+        for n in ranked
+    ]
+
+
 def query_graph(
     pattern: str,
     target: str,
     repo_root: str | None = None,
     detail_level: str = "standard",
+    max_results: int = 100,
 ) -> dict[str, Any]:
     """Run a predefined graph query.
 
@@ -150,12 +184,17 @@ def query_graph(
         target: The node name, qualified name, or file path to query about.
         repo_root: Repository root path. Auto-detected if omitted.
         detail_level: "standard" (full output) or "minimal" (summary only).
+        max_results: Cap on results returned (default 100). Excess count
+            is reported in ``results_omitted`` so agents know when to refine.
 
     Returns:
-        Matching nodes and edges for the query.
+        Matching nodes and edges for the query, plus graph_meta for staleness
+        awareness and results_omitted when the cap is hit.
     """
     store, root = _get_store(repo_root)
     try:
+        meta = graph_meta(store, root)
+
         if pattern not in _QUERY_PATTERNS:
             return {
                 "status": "error",
@@ -183,7 +222,7 @@ def query_graph(
                     f"'{target}' is a common builtin "
                     "— callers_of skipped to avoid noise."
                 ),
-                "results": [], "edges": [],
+                "results": [], "edges": [], "graph_meta": meta,
             }
 
         # Resolve target - try as-is, then as absolute path, then search
@@ -192,25 +231,33 @@ def query_graph(
             abs_target = str(root / target)
             node = store.get_node(abs_target)
         if not node:
-            # Search by name
-            candidates = store.search_nodes(target, limit=5)
+            # Search by name — return ranked disambiguation on multi-match
+            candidates = store.search_nodes(target, limit=10)
             if len(candidates) == 1:
                 node = candidates[0]
                 target = node.qualified_name
             elif len(candidates) > 1:
+                ranked = _rank_disambiguation_candidates(candidates, target)
                 return {
                     "status": "ambiguous",
                     "summary": (
-                        f"Multiple matches for '{target}'. "
-                        "Please use a qualified name."
+                        f"'{target}' matches {len(candidates)} node(s). "
+                        "Re-run with the qualified_name from the "
+                        "disambiguation list."
                     ),
-                    "candidates": [node_to_dict(c) for c in candidates],
+                    "disambiguation": ranked,
+                    "hint": (
+                        "Use the 'qualified_name' field from one of the entries "
+                        "above as the 'target' parameter."
+                    ),
+                    "graph_meta": meta,
                 }
 
         if not node and pattern != "file_summary":
             return {
                 "status": "not_found",
                 "summary": f"No node found matching '{target}'.",
+                "graph_meta": meta,
             }
 
         qn = node.qualified_name if node else target
@@ -308,9 +355,16 @@ def query_graph(
             for n in file_nodes:
                 results.append(node_to_dict(n))
 
+        # Apply max_results cap and record how many were omitted
+        total_results = len(results)
+        results_omitted = max(0, total_results - max_results)
+        results = results[:max_results]
+        edges_out = edges_out[:max_results]
+
         summary = (
-            f"Found {len(results)} result(s) "
+            f"Found {total_results} result(s) "
             f"for {pattern}('{target}')"
+            + (f" — showing {max_results}, {results_omitted} omitted" if results_omitted else "")
         )
 
         if detail_level == "minimal":
@@ -322,14 +376,17 @@ def query_graph(
                 }
                 for r in results[:5]
             ]
+            results_omitted_minimal = max(0, total_results - 5)
             return {
                 "status": "ok",
                 "pattern": pattern,
                 "target": target,
                 "description": _QUERY_PATTERNS[pattern],
                 "summary": summary,
-                "result_count": len(results),
+                "result_count": total_results,
                 "results": minimal_results,
+                "results_omitted": results_omitted_minimal,
+                "graph_meta": meta,
             }
 
         return {
@@ -340,6 +397,8 @@ def query_graph(
             "summary": summary,
             "results": results,
             "edges": edges_out,
+            "results_omitted": results_omitted,
+            "graph_meta": meta,
         }
     finally:
         store.close()
@@ -393,6 +452,8 @@ def semantic_search_nodes(
             f" (kind={kind})" if kind else ""
         )
 
+        meta = graph_meta(store, root)
+
         if detail_level == "minimal":
             minimal_results = [
                 {
@@ -402,12 +463,15 @@ def semantic_search_nodes(
                 }
                 for r in results[:5]
             ]
+            results_omitted = max(0, len(results) - 5)
             return {
                 "status": "ok",
                 "query": query,
                 "search_mode": search_mode,
                 "summary": summary,
                 "results": minimal_results,
+                "results_omitted": results_omitted,
+                "graph_meta": meta,
             }
 
         result: dict[str, object] = {
@@ -416,6 +480,7 @@ def semantic_search_nodes(
             "search_mode": search_mode,
             "summary": summary,
             "results": results,
+            "graph_meta": meta,
         }
         result["_hints"] = generate_hints(
             "semantic_search_nodes", result, get_session()
