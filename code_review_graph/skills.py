@@ -145,6 +145,22 @@ PLATFORMS: dict[str, dict[str, Any]] = {
         "format": "object",
         "needs_type": True,
     },
+    "bob-cli": {
+        "name": "Bob CLI",
+        "config_path": lambda root: Path.home() / ".bob" / "mcp-config.json",
+        "key": "mcpServers",
+        "detect": lambda: (Path.home() / ".bob").exists() or bool(shutil.which("bob")),
+        "format": "object",
+        "needs_type": True,
+    },
+    "bob-ide": {
+        "name": "Bob IDE",
+        "config_path": lambda root: root / ".bob" / "mcp.json",
+        "key": "mcpServers",
+        "detect": lambda: True,
+        "format": "object",
+        "needs_type": True,
+    },
 }
 
 

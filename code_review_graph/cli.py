@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 _PLATFORM_CHOICES = [
     "codex", "claude", "claude-code", "cursor", "windsurf", "zed",
     "continue", "opencode", "antigravity", "gemini-cli", "qwen", "kiro", "qoder",
-    "copilot", "copilot-cli", "all",
+    "copilot", "copilot-cli", "bob-cli", "bob-ide", "all",
 ]
 
 
