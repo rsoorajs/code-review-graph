@@ -143,6 +143,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".v": "verilog",
     ".vh": "verilog",
     ".sql": "sql",
+    ".properties": "properties",
 }
 
 # Shebang interpreter → language mapping for extension-less Unix scripts.
@@ -501,6 +502,11 @@ _TEMPORAL_METHOD_ANNOTATIONS = frozenset({
 
 # Kafka consumer annotations (annotation-based pattern)
 _KAFKA_LISTENER_ANNOTATIONS = frozenset({"KafkaListener", "KafkaHandler"})
+
+# MicroProfile / JAX-RS REST client annotations
+_REST_CLIENT_ANNOTATIONS = frozenset({"RegisterRestClient"})
+_HTTP_METHOD_ANNOTATIONS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"})
+_REDIS_CHANNEL_ANNOTATIONS = frozenset({"ConfigProperty"})
 
 # Kafka consumer field types (reactive / imperative)
 _KAFKA_CONSUMER_TYPES = frozenset({
@@ -862,6 +868,9 @@ class CodeParser:
         has no suffix at all.  See issue #237.
         """
         suffix = path.suffix.lower()
+        # Quarkus/Spring Boot config files: application*.yml / application*.yaml
+        if suffix in (".yml", ".yaml") and path.stem.startswith("application"):
+            return "quarkus-config"
         lang = self._extension_map.get(suffix)
         if lang is not None:
             return lang
@@ -988,6 +997,15 @@ class CodeParser:
         # regex fallback for CREATE PROCEDURE (unsupported by the grammar).
         if language == "sql":
             return self._parse_sql(path, source)
+
+        # Java .properties files: extract key=value pairs relevant to microservice
+        # communication (REST client URLs, Redis channels, Kafka bootstrap servers).
+        if language == "properties":
+            return self._parse_properties(path, source)
+
+        # Quarkus/Spring Boot application.yml: extract REST client URLs, Redis channels.
+        if language == "quarkus-config":
+            return self._parse_quarkus_config(path, source)
 
         parser = self._get_parser(language)
         if not parser:
@@ -1999,6 +2017,399 @@ class CodeParser:
         "create_view",
         "create_function",
     })
+
+    def _parse_quarkus_config(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Parse application.yml Quarkus/Spring Boot config files.
+
+        Extracts:
+        - ``quarkus.rest-client.<configKey>.url`` → Config node + CONFIGURES edge
+        - ``redis.channels`` → Config node + SUBSCRIBES edges per channel
+        - ``kafka.bootstrap.servers`` → Config node
+        """
+        try:
+            import yaml  # PyYAML — available in the crg venv
+        except ImportError:
+            return [], []
+
+        file_path_str = str(path)
+        nodes: list[NodeInfo] = []
+        edges: list[EdgeInfo] = []
+
+        nodes.append(NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language="quarkus-config",
+        ))
+
+        try:
+            data = yaml.safe_load(source.decode("utf-8", errors="replace")) or {}
+        except Exception:
+            return nodes, edges
+
+        if not isinstance(data, dict):
+            return nodes, edges
+
+        # --- Quarkus REST clients: quarkus.rest-client.<configKey>.url ---
+        quarkus = data.get("quarkus", {}) or {}
+        rest_client_block = quarkus.get("rest-client", {}) or {}
+        for config_key, client_cfg in rest_client_block.items():
+            if not isinstance(client_cfg, dict):
+                continue
+            url = client_cfg.get("url")
+            if not url:
+                continue
+            node_name = f"rest-client:{config_key}"
+            nodes.append(NodeInfo(
+                kind="Config",
+                name=node_name,
+                file_path=file_path_str,
+                line_start=1,
+                line_end=1,
+                language="quarkus-config",
+                extra={
+                    "config_type": "rest_client_url",
+                    "config_key": config_key,
+                    "url": str(url),
+                },
+            ))
+            edges.append(EdgeInfo(
+                kind="CONFIGURES",
+                source=file_path_str,
+                target=node_name,
+                file_path=file_path_str,
+                line=1,
+                extra={"config_key": config_key, "url": str(url)},
+            ))
+
+        # --- Redis channels ---
+        redis_block = data.get("redis", {}) or {}
+        channels_val = redis_block.get("channels")
+        if channels_val:
+            if isinstance(channels_val, list):
+                channels = [str(c).strip() for c in channels_val if c]
+            else:
+                channels = [c.strip() for c in str(channels_val).split(",") if c.strip()]
+            if channels:
+                node_name = "redis:channels"
+                nodes.append(NodeInfo(
+                    kind="Config",
+                    name=node_name,
+                    file_path=file_path_str,
+                    line_start=1,
+                    line_end=1,
+                    language="quarkus-config",
+                    extra={"config_type": "redis_channels", "channels": channels},
+                ))
+                for channel in channels:
+                    edges.append(EdgeInfo(
+                        kind="SUBSCRIBES",
+                        source=file_path_str,
+                        target=f"redis:{channel}",
+                        file_path=file_path_str,
+                        line=1,
+                        extra={"channel": channel},
+                    ))
+
+        # --- Kafka bootstrap ---
+        kafka_block = data.get("kafka", {}) or {}
+        bootstrap = kafka_block.get("bootstrap", {}) or {}
+        servers = bootstrap.get("servers") if isinstance(bootstrap, dict) else None
+        if servers:
+            nodes.append(NodeInfo(
+                kind="Config",
+                name="kafka:bootstrap",
+                file_path=file_path_str,
+                line_start=1,
+                line_end=1,
+                language="quarkus-config",
+                extra={"config_type": "kafka_bootstrap", "servers": str(servers)},
+            ))
+
+        # --- Spring Boot support ---
+        spring_block = data.get("spring", {}) or {}
+        if spring_block:
+            # spring.kafka.bootstrap-servers
+            spring_kafka = spring_block.get("kafka", {}) or {}
+            spring_bootstrap = spring_kafka.get("bootstrap-servers")
+            if spring_bootstrap:
+                nodes.append(NodeInfo(
+                    kind="Config",
+                    name="kafka:bootstrap",
+                    file_path=file_path_str,
+                    line_start=1,
+                    line_end=1,
+                    language="quarkus-config",
+                    extra={"config_type": "kafka_bootstrap", "servers": str(spring_bootstrap)},
+                ))
+
+            # spring.redis.host (Spring Boot 2.x) or spring.data.redis.host (3.x)
+            spring_redis = spring_block.get("redis", {}) or spring_block.get("data", {}).get("redis", {}) or {}
+            redis_host = spring_redis.get("host")
+            if redis_host:
+                nodes.append(NodeInfo(
+                    kind="Config",
+                    name="redis:host",
+                    file_path=file_path_str,
+                    line_start=1,
+                    line_end=1,
+                    language="quarkus-config",
+                    extra={"config_type": "redis_host", "host": str(redis_host)},
+                ))
+
+        # app.redis.host (Spring Boot custom redis config)
+        app_block = data.get("app", {}) or {}
+        app_redis = app_block.get("redis", {}) or {}
+        app_redis_host = app_redis.get("host")
+        if app_redis_host:
+            nodes.append(NodeInfo(
+                kind="Config",
+                name="redis:host",
+                file_path=file_path_str,
+                line_start=1,
+                line_end=1,
+                language="quarkus-config",
+                extra={"config_type": "redis_host", "host": str(app_redis_host)},
+            ))
+
+        # Spring Boot custom Kafka topics: kafka.consumer.topic.<name>.name (recursive walk)
+        kafka_custom = data.get("kafka", {}) or {}
+        consumer_block = kafka_custom.get("consumer", {}) or {}
+        topic_block = consumer_block.get("topic", {}) or {}
+
+        def _extract_spring_kafka_topics(block: dict, path: str = "") -> list[tuple[str, str]]:
+            """Walk nested dict collecting leaf nodes that have a 'name' key."""
+            results = []
+            if not isinstance(block, dict):
+                return results
+            if "name" in block and isinstance(block["name"], str):
+                results.append((path, block["name"]))
+            else:
+                for k, v in block.items():
+                    results.extend(_extract_spring_kafka_topics(v, k))
+            return results
+
+        for channel_key, topic_name in _extract_spring_kafka_topics(topic_block):
+            node_name = f"kafka:{topic_name}"
+            nodes.append(NodeInfo(
+                kind="Config",
+                name=node_name,
+                file_path=file_path_str,
+                line_start=1,
+                line_end=1,
+                language="quarkus-config",
+                extra={"config_type": "kafka_consumer_topic", "channel": channel_key, "topic": topic_name},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONSUMES",
+                source=file_path_str,
+                target=node_name,
+                file_path=file_path_str,
+                line=1,
+                extra={"channel": channel_key, "topic": topic_name, "direction": "incoming"},
+            ))
+
+        # Spring Boot REST client URLs: any top-level block with keys ending in *-base-url or *-url
+        # Common pattern: core-endpoints.*-base-url, custom-endpoints.*-url, etc.
+        for block_name, block_val in data.items():
+            if not isinstance(block_val, dict):
+                continue
+            if block_name in ("quarkus", "spring", "kafka", "mp", "redis", "app", "air-hospital",
+                               "api-manager", "cache", "mapping-configuration", "security",
+                               "management", "logging", "server", "audit"):
+                continue
+            for key, val in block_val.items():
+                if isinstance(val, str) and (key.endswith("-base-url") or key.endswith("-url")):
+                    config_key = f"{block_name}.{key}"
+                    node_name = f"rest-client:{config_key}"
+                    nodes.append(NodeInfo(
+                        kind="Config",
+                        name=node_name,
+                        file_path=file_path_str,
+                        line_start=1,
+                        line_end=1,
+                        language="quarkus-config",
+                        extra={"config_type": "rest_client_url", "config_key": config_key, "url": val},
+                    ))
+                    edges.append(EdgeInfo(
+                        kind="CONFIGURES",
+                        source=file_path_str,
+                        target=node_name,
+                        file_path=file_path_str,
+                        line=1,
+                        extra={"config_key": config_key, "url": val},
+                    ))
+
+        # --- MicroProfile Messaging: mp.messaging.outgoing/incoming.<channel>.topic ---
+        mp_block = data.get("mp", {}) or {}
+        messaging = mp_block.get("messaging", {}) or {}
+        for direction in ("outgoing", "incoming"):
+            direction_block = messaging.get(direction, {}) or {}
+            if not isinstance(direction_block, dict):
+                continue
+            for channel_name, channel_cfg in direction_block.items():
+                if not isinstance(channel_cfg, dict):
+                    continue
+                topic = channel_cfg.get("topic")
+                if not topic:
+                    continue
+                edge_kind = "PRODUCES" if direction == "outgoing" else "CONSUMES"
+                node_name = f"kafka:{topic}"
+                nodes.append(NodeInfo(
+                    kind="Config",
+                    name=node_name,
+                    file_path=file_path_str,
+                    line_start=1,
+                    line_end=1,
+                    language="quarkus-config",
+                    extra={
+                        "config_type": f"kafka_{direction}",
+                        "channel": channel_name,
+                        "topic": topic,
+                    },
+                ))
+                edges.append(EdgeInfo(
+                    kind=edge_kind,
+                    source=file_path_str,
+                    target=node_name,
+                    file_path=file_path_str,
+                    line=1,
+                    extra={"channel": channel_name, "topic": topic, "direction": direction},
+                ))
+
+        return nodes, edges
+
+    def _parse_properties(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Parse Java .properties files, extracting microservice config as Config nodes.
+
+        Captures:
+        - REST client base URLs: ``quarkus.rest-client.<configKey>.url``
+        - Redis channels: ``redis.channels``
+        - Kafka bootstrap: ``kafka.bootstrap.servers``
+        - Generic MP REST client URLs: ``<configKey>/mp-rest/url``
+        """
+        _REST_URL_RE = re.compile(
+            r"^(?:quarkus\.rest-client\.|%\w+\.quarkus\.rest-client\.)([^.=\s]+)\.url\s*=\s*(.+)$",
+            re.MULTILINE,
+        )
+        _MP_REST_URL_RE = re.compile(
+            r"^([^/\s=]+)/mp-rest/url\s*=\s*(.+)$",
+            re.MULTILINE,
+        )
+        _REDIS_CHANNELS_RE = re.compile(
+            r"^redis\.channels\s*=\s*(.+)$",
+            re.MULTILINE,
+        )
+        _KAFKA_BOOTSTRAP_RE = re.compile(
+            r"^(?:kafka\.bootstrap\.servers|%\w+\.kafka\.bootstrap\.servers)\s*=\s*(.+)$",
+            re.MULTILINE,
+        )
+
+        file_path_str = str(path)
+        nodes: list[NodeInfo] = []
+        edges: list[EdgeInfo] = []
+
+        try:
+            text = source.decode("utf-8", errors="replace")
+        except Exception:
+            return [], []
+
+        nodes.append(NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=text.count("\n") + 1,
+            language="properties",
+        ))
+
+        lines_list = text.splitlines()
+
+        def _line_of(match_start: int) -> int:
+            return text[:match_start].count("\n") + 1
+
+        # REST client URLs (quarkus.rest-client.<key>.url and <key>/mp-rest/url)
+        seen_keys: set[str] = set()
+        for pattern in (_REST_URL_RE, _MP_REST_URL_RE):
+            for m in pattern.finditer(text):
+                config_key = m.group(1).strip()
+                url = m.group(2).strip()
+                if config_key in seen_keys:
+                    continue
+                seen_keys.add(config_key)
+                node_name = f"rest-client:{config_key}"
+                nodes.append(NodeInfo(
+                    kind="Config",
+                    name=node_name,
+                    file_path=file_path_str,
+                    line_start=_line_of(m.start()),
+                    line_end=_line_of(m.start()),
+                    language="properties",
+                    extra={
+                        "config_type": "rest_client_url",
+                        "config_key": config_key,
+                        "url": url,
+                    },
+                ))
+                edges.append(EdgeInfo(
+                    kind="CONFIGURES",
+                    source=file_path_str,
+                    target=node_name,
+                    file_path=file_path_str,
+                    line=_line_of(m.start()),
+                    extra={"config_key": config_key, "url": url},
+                ))
+
+        # Redis channels
+        for m in _REDIS_CHANNELS_RE.finditer(text):
+            channels_raw = m.group(1).strip()
+            channels = [c.strip() for c in channels_raw.split(",") if c.strip()]
+            node_name = "redis:channels"
+            nodes.append(NodeInfo(
+                kind="Config",
+                name=node_name,
+                file_path=file_path_str,
+                line_start=_line_of(m.start()),
+                line_end=_line_of(m.start()),
+                language="properties",
+                extra={
+                    "config_type": "redis_channels",
+                    "channels": channels,
+                },
+            ))
+            for channel in channels:
+                edges.append(EdgeInfo(
+                    kind="SUBSCRIBES",
+                    source=file_path_str,
+                    target=f"redis:{channel}",
+                    file_path=file_path_str,
+                    line=_line_of(m.start()),
+                    extra={"channel": channel},
+                ))
+
+        # Kafka bootstrap
+        for m in _KAFKA_BOOTSTRAP_RE.finditer(text):
+            bootstrap = m.group(1).strip()
+            nodes.append(NodeInfo(
+                kind="Config",
+                name="kafka:bootstrap",
+                file_path=file_path_str,
+                line_start=_line_of(m.start()),
+                line_end=_line_of(m.start()),
+                language="properties",
+                extra={
+                    "config_type": "kafka_bootstrap",
+                    "servers": bootstrap,
+                },
+            ))
+
+        return nodes, edges
 
     def _parse_sql(
         self, path: Path, source: bytes,
@@ -4081,6 +4492,34 @@ class CodeParser:
                 ))
 
     @staticmethod
+    @staticmethod
+    def _get_annotation_arg(annotation_node, key: str) -> Optional[str]:
+        """Extract a single string argument value from an annotation by key name.
+
+        Handles both ``@Ann(key = "value")`` and ``@Ann("value")`` (single-value
+        shorthand where key defaults to ``value``).
+        """
+        for child in annotation_node.children:
+            if child.type != "annotation_argument_list":
+                continue
+            for pair in child.children:
+                if pair.type == "element_value_pair":
+                    key_node = next(
+                        (c for c in pair.children if c.type == "identifier"), None
+                    )
+                    if key_node is None:
+                        continue
+                    if key_node.text.decode("utf-8", errors="replace") != key:
+                        continue
+                    for val in pair.children:
+                        if val.type == "string_literal":
+                            return val.text.decode("utf-8", errors="replace").strip('"').strip("'")
+                elif pair.type == "string_literal" and key == "value":
+                    # Single-value shorthand: @Ann("somevalue")
+                    return pair.text.decode("utf-8", errors="replace").strip('"').strip("'")
+        return None
+
+    @staticmethod
     def _get_kafka_annotation_topics(annotation_node) -> list[str]:
         """Extract topic strings from @KafkaListener(topics = "...") or topics = {"a","b"}."""
         topics: list[str] = []
@@ -4296,6 +4735,30 @@ class CodeParser:
                 role = "workflow_interface" if is_wf else "activity_interface"
                 extra["temporal_role"] = role
 
+            # MicroProfile REST Client: extract configKey and class-level @Path
+            if any(a in _REST_CLIENT_ANNOTATIONS for a in class_annotations):
+                extra["rest_client"] = True
+                for mod_child in child.children:
+                    if mod_child.type != "modifiers":
+                        continue
+                    for ann in mod_child.children:
+                        if ann.type not in ("annotation", "marker_annotation"):
+                            continue
+                        ann_name_node = next(
+                            (s for s in ann.children if s.type == "identifier"), None
+                        )
+                        if ann_name_node is None:
+                            continue
+                        ann_name = ann_name_node.text.decode("utf-8", errors="replace")
+                        if ann_name == "RegisterRestClient":
+                            config_key = self._get_annotation_arg(ann, "configKey")
+                            if config_key:
+                                extra["rest_client_config_key"] = config_key
+                        elif ann_name == "Path":
+                            path_val = self._get_annotation_arg(ann, "value")
+                            if path_val:
+                                extra["http_path"] = path_val
+
         node = NodeInfo(
             kind="Class",
             name=name,
@@ -4444,6 +4907,31 @@ class CodeParser:
                 self._emit_kafka_edges_from_method(
                     child, name, enclosing_class, file_path, edges,
                 )
+
+        # Java: extract JAX-RS / MicroProfile REST method annotations (@GET, @Path, etc.)
+        if language == "java":
+            for sub in child.children:
+                if sub.type != "modifiers":
+                    continue
+                for ann in sub.children:
+                    if ann.type not in ("annotation", "marker_annotation"):
+                        continue
+                    ann_name_node = next(
+                        (s for s in ann.children if s.type == "identifier"), None
+                    )
+                    if ann_name_node is None:
+                        continue
+                    ann_name = ann_name_node.text.decode("utf-8", errors="replace")
+                    if ann_name in _HTTP_METHOD_ANNOTATIONS:
+                        method_extra["http_method"] = ann_name
+                    elif ann_name == "Path":
+                        path_val = self._get_annotation_arg(ann, "value")
+                        if path_val:
+                            method_extra["http_path"] = path_val
+                    elif ann_name == "ConfigProperty":
+                        prop_name = self._get_annotation_arg(ann, "name")
+                        if prop_name:
+                            method_extra.setdefault("config_properties", []).append(prop_name)
 
         node = NodeInfo(
             kind=kind,
